@@ -63,10 +63,14 @@ jobs:
       - name: Install crane 0.22.1 (checksum-verified)
         run: |
           set -euo pipefail
-          curl -fsSL -o /tmp/go-containerregistry_Linux_x86_64.tar.gz https://github.com/google/go-containerregistry/releases/download/v0.22.1/go-containerregistry_Linux_x86_64.tar.gz
-          curl -fsSL -o /tmp/checksums.txt https://github.com/google/go-containerregistry/releases/download/v0.22.1/checksums.txt
-          (cd /tmp && grep 'go-containerregistry_Linux_x86_64.tar.gz' checksums.txt | sha256sum -c -)
-          tar --no-same-owner -xzf /tmp/go-containerregistry_Linux_x86_64.tar.gz -C /tmp crane
+          VERSION=v0.22.1
+          ARCHIVE=go-containerregistry_Linux_x86_64.tar.gz
+          SHA256=0ab7a1d6932a213aed964ce97666c3077fe691c8606413674a8b3e0b9ec4cda0
+          URL="https://github.com/google/go-containerregistry/releases/download/${VERSION}"
+          cd /tmp
+          curl -fsSL --retry 3 -o "$ARCHIVE" "$URL/$ARCHIVE"
+          echo "$SHA256  $ARCHIVE" | sha256sum -c -
+          tar --no-same-owner -xzf "$ARCHIVE" -C /tmp crane
           sudo install -m 755 /tmp/crane /usr/local/bin/crane
           crane version
 
@@ -75,7 +79,7 @@ jobs:
           set -euo pipefail
           mkdir -p stage/opt/ComfyUI/models/diffusion_models stage/opt/ComfyUI/models/text_encoders stage/opt/ComfyUI/models/vae layers
           M=stage/opt/ComfyUI/models
-          # Retry keeps the .part file so curl -C - resumes; only a hash/size
+          # Retry keeps the .part file so curl -C - resumes; only a hash
           # mismatch discards it.
           dl() { # $1=url $2=dest $3=sha256
             local url="$1" dest="$2" sha="$3"
@@ -94,30 +98,16 @@ jobs:
             done
             echo "FAILED: $url" >&2; return 1
           }
-          dl_part() { # $1=url $2=dest $3=range $4=expected_size
-            local url="$1" dest="$2" range="$3" expected="$4"
-            for i in 1 2 3 4 5; do
-              if curl -fL -r "$range" -C - --connect-timeout 30 --speed-limit 1024 --speed-time 120 \
-                   -o "${dest}.part" "$url"; then
-                if [ "$(wc -c < "${dest}.part")" = "$expected" ]; then
-                  mv "${dest}.part" "$dest"; return 0
-                fi
-                echo "part size mismatch (expected $expected), discarding" >&2
-                rm -f "${dest}.part"
-              else
-                echo "part download failed (attempt $i), keeping partial file for resume" >&2
-              fi
-              sleep 15
-            done
-            echo "FAILED part: $url [$range]" >&2; return 1
-          }
-          # Chroma (17.8 GB) in 8 GiB ranged slices, then verify the joined hash.
+          # Chroma first: full download, verify, split, then free the
+          # original before fetching the smaller models (peak ~35.6 GB).
+          # (Ranged download + resume is NOT used: curl -r and -C - do not
+          # combine correctly — on resume curl drops the range end and
+          # fetches to end-of-file. Verified empirically.)
           CHROMA_URL=https://huggingface.co/lodestones/Chroma1-HD/resolve/$CHROMA_COMMIT/Chroma1-HD.safetensors
-          dl_part "$CHROMA_URL" "$M/diffusion_models/chroma.part-00" "0-8589934591" 8589934592
-          dl_part "$CHROMA_URL" "$M/diffusion_models/chroma.part-01" "8589934592-17179869183" 8589934592
-          dl_part "$CHROMA_URL" "$M/diffusion_models/chroma.part-02" "17179869184-" 620169104
-          cat "$M/diffusion_models/chroma.part-00" "$M/diffusion_models/chroma.part-01" "$M/diffusion_models/chroma.part-02" \
-            | sha256sum -c <(echo "$CHROMA_SHA256  -")
+          dl "$CHROMA_URL" "$M/diffusion_models/Chroma1-HD.safetensors" "$CHROMA_SHA256"
+          test "$(wc -c < "$M/diffusion_models/Chroma1-HD.safetensors")" = "$CHROMA_SIZE"
+          split -b 8G -d -a 2 "$M/diffusion_models/Chroma1-HD.safetensors" "$M/diffusion_models/chroma.part-"
+          rm "$M/diffusion_models/Chroma1-HD.safetensors"
           dl https://huggingface.co/silveroxides/flan-t5-xxl-encoder-only/resolve/$T5_COMMIT/flan-t5-xxl_float8_e4m3fn_scaled_stochastic.safetensors \
              "$M/text_encoders/flan-t5-xxl_float8_e4m3fn_scaled_stochastic.safetensors" "$T5_SHA256"
           dl https://huggingface.co/Comfy-Org/Lumina_Image_2.0_Repackaged/resolve/$AE_COMMIT/split_files/vae/ae.safetensors \
@@ -133,6 +123,8 @@ jobs:
           # not free disk — and keeping them lets a crashed assembly retry.
           # The wrapper launches ComfyUI via relative "init.sh", so the API
           # must be exec'd from /opt/ComfyUI, not from the models dir.
+          # __CHROMA_SIZE__ / __CHROMA_SHA256__ are filled in from the env
+          # below so the model constants live in exactly one place.
           cat > stage/opt/ComfyUI/assemble.sh <<'EOS'
           #!/bin/sh
           # Reassemble the split Chroma model (if needed), then start the ComfyUI API.
@@ -140,11 +132,17 @@ jobs:
           set -e
           MODEL=/opt/ComfyUI/models/diffusion_models/Chroma1-HD.safetensors
           TMP="${MODEL}.tmp"
-          SIZE=17800038288
-          SHA=d446d9695d08276f61e53653e025289dd96f7a489c27982a1fa54ecabc06642a
+          SIZE=__CHROMA_SIZE__
+          SHA=__CHROMA_SHA256__
           cd /opt/ComfyUI/models/diffusion_models
           if [ ! -f "$MODEL" ] || [ "$(wc -c < "$MODEL")" != "$SIZE" ]; then
             echo "Assembling Chroma1-HD from parts..."
+            AVAILABLE=$(df -PB1 . | awk 'NR==2 {print $4}')
+            REQUIRED=$((SIZE + 2 * 1024 * 1024 * 1024))
+            if [ "$AVAILABLE" -lt "$REQUIRED" ]; then
+              echo "ERROR: not enough disk for assembly (need $REQUIRED, have $AVAILABLE)" >&2
+              exit 1
+            fi
             rm -f "$TMP"
             cat chroma.part-00 chroma.part-01 chroma.part-02 > "$TMP"
             [ "$(wc -c < "$TMP")" = "$SIZE" ] || { echo "assembled Chroma size mismatch" >&2; exit 1; }
@@ -155,6 +153,8 @@ jobs:
           cd /opt/ComfyUI
           exec /opt/ComfyUI/comfyui-api
           EOS
+          sed -i "s/__CHROMA_SIZE__/$CHROMA_SIZE/; s/__CHROMA_SHA256__/$CHROMA_SHA256/" stage/opt/ComfyUI/assemble.sh
+          grep -q "$CHROMA_SHA256" stage/opt/ComfyUI/assemble.sh
           chmod +x stage/opt/ComfyUI/assemble.sh
           TARFLAGS="--sort=name --mtime=@0 --owner=0 --group=0 --numeric-owner"
           tar $TARFLAGS -cf layers/chroma-part-00.tar -C stage opt/ComfyUI/models/diffusion_models/chroma.part-00
@@ -177,7 +177,7 @@ jobs:
 
       - name: Append layers and push test tag
         run: |
-          echo "TEST_TAG=$TARGET-test-$GITHUB_RUN_ID" >> "$GITHUB_ENV"
+          echo "TEST_TAG=$TARGET-test-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" >> "$GITHUB_ENV"
           crane append --platform linux/amd64 \
             -b "$BASE@$BASE_DIGEST" \
             -f layers/chroma-part-00.tar \
@@ -186,7 +186,7 @@ jobs:
             -f layers/text_encoders.tar \
             -f layers/vae.tar \
             -f layers/assemble.tar \
-            -t "$TARGET-test-$GITHUB_RUN_ID"
+            -t "$TARGET-test-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
 
       - name: Verify test image
         run: |
@@ -202,7 +202,7 @@ jobs:
           bl, tl = base["rootfs"]["diff_ids"], target["rootfs"]["diff_ids"]
           assert len(tl) == len(bl) + 6, f"layer count {len(tl)} != base {len(bl)} + 6"
           assert tl[:len(bl)] == bl, "base layers changed"
-          for key in ("Cmd", "WorkingDir", "User"):
+          for key in ("Entrypoint", "Cmd", "WorkingDir", "User", "Env", "ExposedPorts", "Healthcheck", "StopSignal", "Volumes"):
               assert target["config"].get(key) == base["config"].get(key), key
           assert target["architecture"] == "amd64" and target["os"] == "linux"
           assert "MODEL_DIR=/opt/ComfyUI/models" in target["config"].get("Env", [])
@@ -211,9 +211,15 @@ jobs:
           print(f"compressed image: {total/1e9:.2f} GB; largest layer: {max(x['size'] for x in layers)/1e9:.2f} GB")
           assert all(x["size"] < 10_000_000_000 for x in layers), "GHCR layer size limit exceeded"
           assert total < 35_000_000_000, "Salad image size limit (35 GB compressed) exceeded"
-          print("image verified: 6 new layers, base intact, MODEL_DIR present, size within limits")
+          print("image verified: 6 new layers, base config intact, MODEL_DIR present, size within limits")
           PY
           crane digest "$TEST_TAG"
 
       - name: Promote test tag to chroma1-hd
-        run: crane copy "$TEST_TAG" "$TARGET"
+        run: |
+          set -euo pipefail
+          EXPECTED=$(crane digest "$TEST_TAG")
+          crane copy "$TEST_TAG" "$TARGET"
+          ACTUAL=$(crane digest "$TARGET")
+          test "$EXPECTED" = "$ACTUAL"
+          echo "promoted $TARGET @$ACTUAL"
