@@ -16,8 +16,12 @@ them to the base image with `crane append`, then pushes to GHCR.
 
 GHCR allows max 10 GB per layer, so the 17.8 GB Chroma file is split
 into 8 GiB parts (one layer each). At container start the parts are
-reassembled by `assemble.sh` — run it via the Salad group's command
-override: `["/bin/sh", "/opt/ComfyUI/assemble.sh"]`.
+reassembled by `assemble.sh` — atomically (into a `.tmp` file, size +
+SHA256 verified, then renamed; the parts are kept so a crashed assembly
+can retry) — run it via the Salad group's command override:
+`["/bin/sh", "/opt/ComfyUI/assemble.sh"]`. Salad's max container image
+size is 35 GB compressed; the build asserts the pushed image stays
+under it.
 
 Result: `ghcr.io/ththth-mokarate/mokarate-comfyui-chroma:chroma1-hd`
 
